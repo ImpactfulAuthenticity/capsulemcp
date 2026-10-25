@@ -4,6 +4,8 @@
  * top-level server-startup code in `src/http.ts`.
  */
 
+import { isIP } from "node:net";
+
 // Anthropic's known Custom Connector callback URIs. Used as the default
 // redirect_uris allow-list in static-client mode when the env var is not
 // set. Update as Anthropic publishes new ones.
@@ -51,7 +53,7 @@ export type SelectModeResult = { ok: Mode } | { error: string };
  * gate insecure-auto-approve mode against non-loopback hostnames —
  * accidentally deploying that mode to the public internet would let
  * anyone register a client and use the shared Capsule token. The mode
- * must be either pointed at localhost / 127.0.0.1 / ::1, OR explicitly
+ * must be either pointed at a loopback address, OR explicitly
  * confirmed via `MCP_OAUTH_I_KNOW_WHAT_IM_DOING=yes`.
  */
 export function selectMode(
@@ -114,7 +116,7 @@ export function selectMode(
           "MCP_OAUTH_INSECURE_AUTO_APPROVE is set but PUBLIC_BASE_URL is not a localhost address. " +
           "This mode lets anyone who can reach the URL register an OAuth client and use the shared " +
           "Capsule token; it must not be exposed publicly. Either:\n" +
-          "  - Point PUBLIC_BASE_URL at http://localhost / 127.0.0.1 / ::1 (recommended), or\n" +
+          "  - Point PUBLIC_BASE_URL at http://localhost or http://127.0.0.1 (recommended), or\n" +
           "  - Set MCP_OAUTH_I_KNOW_WHAT_IM_DOING=yes to acknowledge the risk (only do this on a private network).",
       };
     }
@@ -126,6 +128,75 @@ export function selectMode(
       "  - Set MCP_OAUTH_CLIENT_ID and MCP_OAUTH_CLIENT_SECRET (recommended for public deployments)\n" +
       "  - Or set MCP_OAUTH_INSECURE_AUTO_APPROVE=1 (only safe for local development or private-network deployments)",
   };
+}
+
+// ── Listen address ──────────────────────────────────────────────────────────
+
+/** True for an address that only accepts connections from this machine. */
+export function isLoopbackAddress(host: string): boolean {
+  if (host === "localhost" || host === "::1") return true;
+  return isIP(host) === 4 && host.startsWith("127.");
+}
+
+export type ListenHostResult = { ok: string | undefined } | { error: string };
+
+/**
+ * The address `app.listen` binds to; `undefined` means every interface.
+ *
+ * Why this exists. `selectMode`'s loopback check only inspects the
+ * `PUBLIC_BASE_URL` string the operator typed — it says nothing about
+ * where the socket listens. Before this, insecure-auto-approve mode
+ * with `PUBLIC_BASE_URL=http://localhost:…` still bound every
+ * interface, so anyone on the same network (office or café Wi-Fi, a
+ * VPN, a `docker run -p` that publishes on all host interfaces) could
+ * POST /register and use the configured Capsule token. Now:
+ *
+ *   - `MCP_HTTP_HOST` set → bind exactly that IP literal. (Not
+ *     `localhost`: Node binds only the first address it resolves to —
+ *     `::1` on many systems — so `localhost` could leave the advertised
+ *     `127.0.0.1` issuer unreachable.) In insecure-auto-approve mode a
+ *     non-loopback value additionally requires
+ *     `MCP_OAUTH_I_KNOW_WHAT_IM_DOING=yes` — the same acknowledgement
+ *     the mode needs for a non-loopback URL.
+ *   - insecure-auto-approve with a loopback `PUBLIC_BASE_URL` → bind
+ *     `127.0.0.1`; clients connecting to `http://localhost` fall back
+ *     from `::1` to it. A loopback URL means the operator intends
+ *     local-only access, so the socket now matches. (An `https://`
+ *     loopback URL means a local TLS proxy sits in front; one whose
+ *     upstream is `[::1]` needs `MCP_HTTP_HOST=::1`.) Containers that
+ *     publish the port need an explicit `MCP_HTTP_HOST=0.0.0.0` plus
+ *     the acknowledgement.
+ *   - everything else (static-client mode, or insecure mode already
+ *     acknowledged for a non-loopback URL) → every interface, as
+ *     before; a container platform such as Cloud Run needs that.
+ */
+export function resolveListenHost(
+  env: NodeJS.ProcessEnv,
+  mode: Mode,
+  publicBaseUrl: string,
+): ListenHostResult {
+  const acknowledged = env["MCP_OAUTH_I_KNOW_WHAT_IM_DOING"]?.toLowerCase() === "yes";
+  const explicit = env["MCP_HTTP_HOST"]?.trim();
+  if (explicit) {
+    if (isIP(explicit) === 0) {
+      return {
+        error: `MCP_HTTP_HOST must be an IP address such as 127.0.0.1, ::1, 0.0.0.0 or ::; got ${JSON.stringify(explicit)}.`,
+      };
+    }
+    if (mode.kind === "insecure-auto-approve" && !isLoopbackAddress(explicit) && !acknowledged) {
+      return {
+        error:
+          `MCP_HTTP_HOST=${explicit} would expose insecure-auto-approve mode beyond this machine: anyone who ` +
+          "can reach that address could register an OAuth client and use the configured Capsule token. Bind a " +
+          "loopback address, or set MCP_OAUTH_I_KNOW_WHAT_IM_DOING=yes to acknowledge the risk (private networks only).",
+      };
+    }
+    return { ok: explicit };
+  }
+  if (mode.kind === "insecure-auto-approve" && isLocalhostUrl(publicBaseUrl)) {
+    return { ok: "127.0.0.1" };
+  }
+  return { ok: undefined };
 }
 
 // ── Base-config validation ──────────────────────────────────────────────────
@@ -201,6 +272,25 @@ export function resolveBaseConfig(env: NodeJS.ProcessEnv = process.env): BaseCon
   if (!isHttps && !isHttpLocal) {
     return {
       error: `PUBLIC_BASE_URL must be https://… (or http://localhost for development); got ${parsedBaseUrl.protocol}//${parsedBaseUrl.hostname}.`,
+    };
+  }
+  // The issuer must not carry a query or fragment (the OAuth layer
+  // crashes on one). Check the raw string too: a bare trailing `?` or
+  // `#` parses to an empty `search`/`hash` yet still ends up in every
+  // URL built from PUBLIC_BASE_URL.
+  if (parsedBaseUrl.search || parsedBaseUrl.hash || /[?#]/.test(publicBaseUrl)) {
+    return {
+      error:
+        "PUBLIC_BASE_URL must not contain a query string or fragment — it is the OAuth issuer, and the OAuth layer refuses one that does.",
+    };
+  }
+  // The MCP SDK's auth router only exempts `localhost` and `127.0.0.1`
+  // from its https-issuer rule; an http://[::1] issuer would pass this
+  // validation and then crash startup with an uncaught stack trace.
+  if (parsedBaseUrl.protocol === "http:" && parsedBaseUrl.hostname === "[::1]") {
+    return {
+      error:
+        "PUBLIC_BASE_URL http://[::1] is not supported: the OAuth layer only accepts a plain-http issuer for localhost or 127.0.0.1. Use http://localhost:<port> instead.",
     };
   }
 

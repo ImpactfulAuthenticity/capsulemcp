@@ -140,25 +140,15 @@ describe("doFetch retry-on-429", () => {
     }
   });
 
-  it("clamps absurdly large integer-seconds Retry-After to 60s", async () => {
-    // capsuleGet's parseRetryAfter clamps to 60s max.
-    vi.useFakeTimers();
-    try {
-      vi.mocked(fetch)
-        .mockResolvedValueOnce(makeResponse(429, {}, { "Retry-After": "9999" }))
-        .mockResolvedValueOnce(makeResponse(200, { ok: true }));
+  it("surfaces an absurdly large integer-seconds Retry-After at once: one fetch, no sleep", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(makeResponse(429, {}, { "Retry-After": "9999" }));
 
-      const { capsuleGet } = await import("../src/capsule/client.js");
-      const promise = capsuleGet<{ ok: boolean }>("/test");
-
-      // Advance just past 60s — retry should have fired by now.
-      await vi.advanceTimersByTimeAsync(60_001);
-      const result = await promise;
-
-      expect(result.data).toEqual({ ok: true });
-    } finally {
-      vi.useRealTimers();
-    }
+    const { capsuleGet } = await import("../src/capsule/client.js");
+    const startedAt = Date.now();
+    // 9999 s is beyond Capsule's one-hour window: capped at 61 min.
+    await expect(capsuleGet("/test")).rejects.toThrow(/resets in about 61 min.*Not retried/s);
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
   });
 
   it("passes through non-429 errors without retry", async () => {
@@ -242,25 +232,176 @@ describe("doFetch retry-on-429", () => {
     }
   });
 
-  it("clamps a far-future X-RateLimit-Reset to 60s (Cloud Run timeout safety)", async () => {
-    // Capsule's hour-bucket can mean a reset 50 minutes out. We can't
-    // block a Cloud Run request that long; clamp at 60s and let the
-    // 429 propagate after one retry.
+  it("surfaces a far-future X-RateLimit-Reset at once: one fetch, no sleep, no doomed retry", async () => {
+    // Capsule's hour-bucket can mean a reset 50 minutes out. Earlier
+    // versions clamped that to a 60 s sleep and then retried — pinning a
+    // request slot for a minute to send a request guaranteed to 429.
     const fiftyMinFromNow = Math.floor((Date.now() + 50 * 60 * 1000) / 1000);
+    vi.mocked(fetch).mockResolvedValueOnce(
+      makeResponse(429, {}, { "X-RateLimit-Reset": String(fiftyMinFromNow) }),
+    );
+
+    const { capsuleGet, CapsuleApiError } = await import("../src/capsule/client.js");
+    const startedAt = Date.now();
+    const err = await capsuleGet("/test").catch((e: unknown) => e);
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(err).toBeInstanceOf(CapsuleApiError);
+    expect((err as InstanceType<typeof CapsuleApiError>).status).toBe(429);
+    expect((err as Error).message).toMatch(/resets in about 50 min/);
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
+  });
+
+  it("still waits and retries once when the reset is within 60 s (boundary)", async () => {
+    vi.useFakeTimers();
+    try {
+      const in59s = Math.floor((Date.now() + 59_000) / 1000);
+      vi.mocked(fetch)
+        .mockResolvedValueOnce(makeResponse(429, {}, { "X-RateLimit-Reset": String(in59s) }))
+        .mockResolvedValueOnce(makeResponse(200, { ok: true }));
+      const { capsuleGet } = await import("../src/capsule/client.js");
+      const promise = capsuleGet<{ ok: boolean }>("/test");
+      await vi.advanceTimersByTimeAsync(60_001);
+      expect((await promise).data).toEqual({ ok: true });
+      expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not wait when the reset is just over 60 s (boundary)", async () => {
+    const in62s = Math.floor((Date.now() + 62_000) / 1000);
+    vi.mocked(fetch).mockResolvedValueOnce(
+      makeResponse(429, {}, { "X-RateLimit-Reset": String(in62s) }),
+    );
+    const { capsuleGet } = await import("../src/capsule/client.js");
+    await expect(capsuleGet("/test")).rejects.toThrow(/resets in about 2 min\. Not retried/);
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
+  });
+
+  it("boundary is exclusive: Retry-After 60 waits and retries, 61 surfaces at once", async () => {
     vi.useFakeTimers();
     try {
       vi.mocked(fetch)
-        .mockResolvedValueOnce(
-          makeResponse(429, {}, { "X-RateLimit-Reset": String(fiftyMinFromNow) }),
-        )
+        .mockResolvedValueOnce(makeResponse(429, {}, { "Retry-After": "60" }))
         .mockResolvedValueOnce(makeResponse(200, { ok: true }));
-
       const { capsuleGet } = await import("../src/capsule/client.js");
       const promise = capsuleGet<{ ok: boolean }>("/test");
-      // Advance 60s + 1ms — the clamped wait should fire by now.
       await vi.advanceTimersByTimeAsync(60_001);
-      const result = await promise;
-      expect(result.data).toEqual({ ok: true });
+      expect((await promise).data).toEqual({ ok: true });
+      expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    vi.mocked(fetch).mockClear();
+    vi.mocked(fetch).mockResolvedValueOnce(makeResponse(429, {}, { "Retry-After": "61" }));
+    const { capsuleGet } = await import("../src/capsule/client.js");
+    await expect(capsuleGet("/test")).rejects.toThrow(/Not retried/);
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces a far-future Retry-After HTTP-date at once", async () => {
+    const inTwentyMin = new Date(Date.now() + 20 * 60_000).toUTCString();
+    vi.mocked(fetch).mockResolvedValueOnce(makeResponse(429, {}, { "Retry-After": inTwentyMin }));
+    const { capsuleGet } = await import("../src/capsule/client.js");
+    await expect(capsuleGet("/test")).rejects.toThrow(/resets in about 20 min/);
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
+  });
+
+  it("caps an absurd reset header at Capsule's one-hour window (no 'Infinity')", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(makeResponse(429, {}, { "X-RateLimit-Reset": "1e306" }));
+    const { capsuleGet } = await import("../src/capsule/client.js");
+    const err = (await capsuleGet("/test").catch((e: unknown) => e)) as Error;
+    expect(err.message).toMatch(/resets in about 61 min/);
+    expect(err.message).not.toMatch(/Infinity|NaN/);
+  });
+
+  it("in the window's last minute a call still fails fast — no hidden sleep a client could time out on", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+      const { openRateLimitWindow } = await import("../src/capsule/rate-limit-window.js");
+      openRateLimitWindow(Date.now() + 30_000);
+      const { capsulePut } = await import("../src/capsule/client.js");
+      // Rejected at once: a write must never sit in a sleep and land
+      // after the MCP client has given up on the call (and retried it).
+      await expect(capsulePut("/parties/1", { party: {} })).rejects.toThrow(/about 1 min/);
+      expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+
+      vi.setSystemTime(new Date("2026-01-01T00:00:30.001Z"));
+      vi.mocked(fetch).mockResolvedValueOnce(makeResponse(200, { ok: true }));
+      expect(await capsulePut<{ ok: boolean }>("/parties/1", { party: {} })).toEqual({ ok: true });
+      expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a short back-off does not retry once a concurrent call has learnt of a long window", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(fetch).mockResolvedValueOnce(makeResponse(429, {}, { "Retry-After": "30" }));
+      const { capsuleGet } = await import("../src/capsule/client.js");
+      const { openRateLimitWindow } = await import("../src/capsule/rate-limit-window.js");
+      const promise = capsuleGet("/parties").catch((e: unknown) => e as Error);
+      await vi.advanceTimersByTimeAsync(10_000);
+      openRateLimitWindow(Date.now() + 40 * 60_000); // learnt by another call meanwhile
+      await vi.advanceTimersByTimeAsync(21_000);
+      const err = await promise;
+      expect((err as Error).message).toMatch(/resets in about 40 min/);
+      expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a wall-clock step backwards cannot stretch the window past the one-hour cap", async () => {
+    const { openRateLimitWindow, rateLimitWindowLeft } = await import(
+      "../src/capsule/rate-limit-window.js"
+    );
+    const now = Date.now();
+    openRateLimitWindow(now + 10 * 60_000);
+    const stepped = now - 2 * 60 * 60_000; // clock jumps two hours back
+    expect(rateLimitWindowLeft(stepped)).toBe(61 * 60_000);
+    // The deadline itself was pulled in, so the window really ENDS 61 min
+    // after the step — not two hours and ten minutes later.
+    expect(rateLimitWindowLeft(stepped + 30 * 60_000)).toBe(31 * 60_000);
+    expect(rateLimitWindowLeft(stepped + 61 * 60_000 + 1)).toBeLessThanOrEqual(0);
+  });
+
+  it("the window is shared by module copies loaded after vi.resetModules()", async () => {
+    const first = await import("../src/capsule/rate-limit-window.js");
+    first.openRateLimitWindow(Date.now() + 50 * 60_000);
+    vi.resetModules();
+    const second = await import("../src/capsule/rate-limit-window.js");
+    expect(second.rateLimitWindowLeft()).toBeGreaterThan(49 * 60_000);
+    second._resetRateLimitStateForTests();
+    expect(first.rateLimitWindowLeft()).toBeLessThanOrEqual(0);
+  });
+
+  it("remembers the announced window: later calls fail fast WITHOUT a request until the reset", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+      const resetEpochSec = Math.floor((Date.now() + 30 * 60_000) / 1000);
+      vi.mocked(fetch).mockResolvedValueOnce(
+        makeResponse(429, {}, { "X-RateLimit-Reset": String(resetEpochSec) }),
+      );
+      const { capsuleGet, capsulePut } = await import("../src/capsule/client.js");
+      await expect(capsuleGet("/parties")).rejects.toThrow(/about 30 min/);
+      expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
+
+      // Inside the window: reads and writes alike are refused locally.
+      await expect(capsuleGet("/opportunities")).rejects.toThrow(/about 30 min/);
+      vi.setSystemTime(new Date("2026-01-01T00:20:00.000Z"));
+      await expect(capsulePut("/parties/1", { party: {} })).rejects.toThrow(/about 10 min/);
+      expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
+
+      // After the reset, requests flow again.
+      vi.setSystemTime(new Date("2026-01-01T00:30:01.000Z"));
+      vi.mocked(fetch).mockResolvedValueOnce(makeResponse(200, { ok: true }));
+      expect((await capsuleGet<{ ok: boolean }>("/parties")).data).toEqual({ ok: true });
+      expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
     } finally {
       vi.useRealTimers();
     }

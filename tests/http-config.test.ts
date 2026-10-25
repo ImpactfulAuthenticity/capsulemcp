@@ -2,6 +2,9 @@ import { describe, it, expect } from "vitest";
 import {
   selectMode,
   resolveBaseConfig,
+  resolveListenHost,
+  isLoopbackAddress,
+  type Mode,
   DEFAULT_ANTHROPIC_REDIRECT_URIS,
   DEFAULT_MCP_CLIENT_ORIGINS,
 } from "../src/http/config.js";
@@ -404,5 +407,158 @@ describe("resolveBaseConfig", () => {
       PORT: "80.5",
     });
     expect("error" in result).toBe(true);
+  });
+});
+
+// ── resolveListenHost ───────────────────────────────────────────────────────
+//
+// The loopback check in selectMode only inspects the PUBLIC_BASE_URL
+// string; the security review reproduced insecure-auto-approve mode with
+// a localhost URL still accepting POST /register on the machine's LAN
+// address. These pin that the SOCKET now matches the URL's intent.
+
+describe("resolveListenHost", () => {
+  const insecure: Mode = { kind: "insecure-auto-approve" };
+  const staticClient: Mode = {
+    kind: "static-client",
+    clientId: "id",
+    clientSecret: "secret-of-at-least-sixteen",
+    redirectUris: ["https://claude.ai/api/mcp/auth_callback"],
+  };
+
+  it("insecure mode + localhost URL binds IPv4 loopback, not every interface", () => {
+    expect(resolveListenHost({}, insecure, "http://localhost:8080")).toEqual({ ok: "127.0.0.1" });
+    expect(resolveListenHost({}, insecure, "http://127.0.0.1:8080")).toEqual({ ok: "127.0.0.1" });
+  });
+
+  it("insecure mode acknowledged for a non-loopback URL keeps binding every interface", () => {
+    const env = { MCP_OAUTH_I_KNOW_WHAT_IM_DOING: "yes" };
+    expect(resolveListenHost(env, insecure, "https://mcp.internal.example")).toEqual({
+      ok: undefined,
+    });
+  });
+
+  it("static-client mode binds every interface (container platforms need it)", () => {
+    expect(resolveListenHost({}, staticClient, "https://mcp.example.com")).toEqual({
+      ok: undefined,
+    });
+  });
+
+  it("MCP_HTTP_HOST is honoured in static-client mode", () => {
+    expect(
+      resolveListenHost({ MCP_HTTP_HOST: "127.0.0.1" }, staticClient, "https://x.example"),
+    ).toEqual({
+      ok: "127.0.0.1",
+    });
+    expect(resolveListenHost({ MCP_HTTP_HOST: " :: " }, staticClient, "https://x.example")).toEqual(
+      {
+        ok: "::",
+      },
+    );
+  });
+
+  it("refuses a non-loopback MCP_HTTP_HOST in insecure mode without the acknowledgement", () => {
+    for (const host of ["0.0.0.0", "::", "192.0.2.10"]) {
+      const result = resolveListenHost({ MCP_HTTP_HOST: host }, insecure, "http://localhost:8080");
+      expect("error" in result, host).toBe(true);
+      if ("error" in result) expect(result.error).toMatch(/MCP_OAUTH_I_KNOW_WHAT_IM_DOING/);
+    }
+  });
+
+  it("allows a non-loopback MCP_HTTP_HOST in insecure mode once acknowledged (e.g. a published container port)", () => {
+    const env = { MCP_HTTP_HOST: "0.0.0.0", MCP_OAUTH_I_KNOW_WHAT_IM_DOING: "YES" };
+    expect(resolveListenHost(env, insecure, "http://localhost:8080")).toEqual({ ok: "0.0.0.0" });
+  });
+
+  it("allows an explicit loopback MCP_HTTP_HOST in insecure mode without acknowledgement", () => {
+    for (const host of ["127.0.0.1", "127.0.0.2", "::1"]) {
+      expect(resolveListenHost({ MCP_HTTP_HOST: host }, insecure, "http://localhost:8080")).toEqual(
+        {
+          ok: host,
+        },
+      );
+    }
+  });
+
+  it("rejects a MCP_HTTP_HOST that is neither an IP literal nor localhost", () => {
+    for (const host of [
+      "localhost",
+      "example.com",
+      "localhost.evil.example",
+      "0.0.0.0:80",
+      "[::1]",
+      "127.1",
+    ]) {
+      const result = resolveListenHost({ MCP_HTTP_HOST: host }, staticClient, "https://x.example");
+      expect("error" in result, host).toBe(true);
+    }
+    // An empty / whitespace-only value counts as unset.
+    expect(resolveListenHost({ MCP_HTTP_HOST: "  " }, insecure, "http://localhost:1")).toEqual({
+      ok: "127.0.0.1",
+    });
+  });
+});
+
+describe("isLoopbackAddress", () => {
+  it("accepts localhost, ::1 and the whole 127/8 block; rejects everything else", () => {
+    for (const ok of ["localhost", "::1", "127.0.0.1", "127.255.0.9"])
+      expect(isLoopbackAddress(ok), ok).toBe(true);
+    for (const no of [
+      "0.0.0.0",
+      "::",
+      "203.0.113.1",
+      "::ffff:127.0.0.1",
+      "127.example.com",
+      "localhost.",
+    ]) {
+      expect(isLoopbackAddress(no), no).toBe(false);
+    }
+  });
+});
+
+describe("resolveBaseConfig — http://[::1]", () => {
+  it("refuses http://[::1] with a clear message (the SDK would crash on it)", () => {
+    const result = resolveBaseConfig({
+      PUBLIC_BASE_URL: "http://[::1]:8080",
+      MCP_OAUTH_SIGNING_KEY: "x".repeat(32),
+    });
+    expect("error" in result).toBe(true);
+    if ("error" in result) expect(result.error).toMatch(/http:\/\/localhost/);
+  });
+});
+
+describe("resolveBaseConfig — issuer shape", () => {
+  it("refuses a PUBLIC_BASE_URL with a query string or fragment (the OAuth layer would crash)", () => {
+    for (const url of [
+      "https://mcp.example.com/?a=1",
+      "https://mcp.example.com/#frag",
+      // Empty query/fragment: `search`/`hash` parse to "" but the raw
+      // character would still be glued into every derived URL.
+      "https://mcp.example.com/?",
+      "https://mcp.example.com#",
+    ]) {
+      const result = resolveBaseConfig({
+        PUBLIC_BASE_URL: url,
+        MCP_OAUTH_SIGNING_KEY: "x".repeat(32),
+      });
+      expect("error" in result, url).toBe(true);
+    }
+  });
+});
+
+describe("resolveListenHost — https loopback URLs", () => {
+  it("binds 127.0.0.1 for every loopback issuer; a proxy upstream on [::1] opts in via MCP_HTTP_HOST", () => {
+    for (const url of ["https://[::1]:8443", "https://localhost:8443", "https://127.0.0.1:8443"]) {
+      expect(resolveListenHost({}, { kind: "insecure-auto-approve" }, url), url).toEqual({
+        ok: "127.0.0.1",
+      });
+    }
+    expect(
+      resolveListenHost(
+        { MCP_HTTP_HOST: "::1" },
+        { kind: "insecure-auto-approve" },
+        "https://[::1]:8443",
+      ),
+    ).toEqual({ ok: "::1" });
   });
 });

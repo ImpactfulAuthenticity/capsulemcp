@@ -22,7 +22,7 @@ Paste this into the file (merge with existing `mcpServers` if you have other con
   "mcpServers": {
     "capsule": {
       "command": "npx",
-      "args": ["-y", "capsulemcp"],
+      "args": ["-y", "capsulemcp@2.4.0"],
       "env": {
         "CAPSULE_API_TOKEN": "<your read-scoped capsule token>",
         "CAPSULE_MCP_READONLY": "1"
@@ -34,7 +34,7 @@ Paste this into the file (merge with existing `mcpServers` if you have other con
 
 Restart Claude Desktop. The Capsule tools appear in the tool picker.
 
-> **Version pinning.** Replace `"capsulemcp"` with `"capsulemcp@2.4.0"` (or any other published version) to pin. By default `npx` resolves to the `latest` tag on npm; for production setups pinning is the safer choice.
+> **Version pinning.** The snippet pins an exact version. Upgrade deliberately by changing it after reading the [release notes](https://github.com/soil-dev/capsulemcp/releases). See [Release integrity](#release-integrity) before switching to the unpinned form.
 >
 > **First launch.** `npx` downloads the pre-built package from npm (a couple of seconds, much faster than the old GitHub-ref flow that had to clone + install + build). Subsequent launches are instant from the npx cache.
 
@@ -51,7 +51,7 @@ Same flags, same env, just installs from a git clone instead of the npm tarball.
 ## Path 2 — Claude Code
 
 ```sh
-claude mcp add capsule --env CAPSULE_API_TOKEN=<your token> -- npx -y capsulemcp
+claude mcp add capsule --env CAPSULE_API_TOKEN=<your token> --env CAPSULE_MCP_READONLY=1 -- npx -y capsulemcp@2.4.0
 ```
 
 This writes the entry to Claude Code's MCP config (`~/.claude.json`). Same `env` model as Claude Desktop's JSON — no shell-export needed.
@@ -60,10 +60,23 @@ If you'd rather not have the token in `~/.claude.json`, omit the `--env` flag an
 
 ```sh
 export CAPSULE_API_TOKEN=<your token>
-claude mcp add capsule -- npx -y capsulemcp
+claude mcp add capsule --env CAPSULE_MCP_READONLY=1 -- npx -y capsulemcp@2.4.0
 ```
 
-To pin a version, replace `capsulemcp` with `capsulemcp@2.4.0`. To install from a GitHub ref instead of npm (development / fork tracking), replace it with `github:soil-dev/capsulemcp#v2.4.0`.
+Drop `CAPSULE_MCP_READONLY=1` only if you want the write tools (and use a write-scoped token for them). To install from a GitHub ref instead of npm (development / fork tracking), replace `capsulemcp@2.4.0` with `github:soil-dev/capsulemcp#v2.4.0`.
+
+## Release integrity
+
+The connector runs on your machine with your Capsule API token in its environment — if you give it a write-scoped token, any code it runs can change or delete CRM data. Two habits keep you in control of *which* code that is:
+
+- **Pin an exact version** (`capsulemcp@X.Y.Z`, as in the snippets above). The unpinned form, `npx -y capsulemcp`, runs whatever npm's `latest` tag points to at the next launch — convenient, and it picks up fixes automatically, but a compromised publish would reach you without any action on your part. Prefer the pinned form, and always with a write-scoped token.
+- **Check who built a version before upgrading.** Releases after 2.4.0 are built by this repository's [`publish.yml`](.github/workflows/publish.yml) GitHub Actions workflow, run on the release tag, and go public only after a maintainer approves them with 2FA. Each carries an npm provenance attestation recording the repository, workflow and tag that produced the tarball. *Having* an attestation proves little — anyone can publish one from their own repository — so check its **identity**:
+
+  ```sh
+  curl -fsS https://registry.npmjs.org/-/npm/v1/attestations/capsulemcp@X.Y.Z | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const a=s&&JSON.parse(s).attestations.find(x=>x.predicateType==="https://slsa.dev/provenance/v1");if(!a){console.log("NO PROVENANCE - do not install");process.exit(1)}const w=JSON.parse(Buffer.from(a.bundle.dsseEnvelope.payload,"base64")).predicate.buildDefinition.externalParameters.workflow;console.log(w.repository,w.path,w.ref)})'
+  ```
+
+  It must print exactly `https://github.com/soil-dev/capsulemcp .github/workflows/publish.yml refs/tags/vX.Y.Z`. Anything else — another repository or workflow, a branch instead of the tag, or `NO PROVENANCE` — means the version was not built by this repository: don't install it, and please report it (see [SECURITY.md](SECURITY.md)). On [npmjs.com/package/capsulemcp](https://www.npmjs.com/package/capsulemcp) the same facts appear on the version page ("Built and signed on GitHub Actions", with links to the source commit and build file). In a project that installs the package, `npm audit signatures` additionally verifies the registry signatures and attestations cryptographically. Versions up to and including 2.4.0 predate the workflow and carry no attestation.
 
 ## Path 3 — Manual install (for development)
 

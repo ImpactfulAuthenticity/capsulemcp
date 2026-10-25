@@ -178,6 +178,51 @@ describe("verdicts", () => {
   });
 });
 
+describe("rate-limit window", () => {
+  it("a 2xx probe closes a remembered window (Capsule is serving this token again)", async () => {
+    const { openRateLimitWindow, rateLimitWindowLeft } = await import(
+      "../src/capsule/rate-limit-window.js"
+    );
+    openRateLimitWindow(Date.now() + 30 * 60_000);
+    respond(200);
+    await checkCapsuleHealth({ force: true });
+    expect(rateLimitWindowLeft()).toBeLessThanOrEqual(0);
+  });
+
+  it("a 2xx probe does NOT close a window opened while it was in flight", async () => {
+    const { openRateLimitWindow, rateLimitWindowLeft } = await import(
+      "../src/capsule/rate-limit-window.js"
+    );
+    // A tool call's 429 lands while a slow probe is still on the wire:
+    // the probe's 200 predates that answer and says nothing about it.
+    vi.mocked(fetch).mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      openRateLimitWindow(Date.now() + 30 * 60_000);
+      return {
+        status: 200,
+        ok: true,
+        headers: new Headers(),
+        body: { cancel: async () => undefined },
+        json: async () => ({}),
+        text: async () => "",
+        statusText: "200",
+      } as unknown as Awaited<ReturnType<typeof fetch>>;
+    });
+    await checkCapsuleHealth({ force: true });
+    expect(rateLimitWindowLeft()).toBeGreaterThan(29 * 60_000);
+  });
+
+  it("a non-2xx probe leaves the window alone", async () => {
+    const { openRateLimitWindow, rateLimitWindowLeft } = await import(
+      "../src/capsule/rate-limit-window.js"
+    );
+    openRateLimitWindow(Date.now() + 30 * 60_000);
+    respond(429);
+    await checkCapsuleHealth({ force: true });
+    expect(rateLimitWindowLeft()).toBeGreaterThan(29 * 60_000);
+  });
+});
+
 describe("cache", () => {
   it("serves the cached verdict within the TTL and re-probes after it", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });

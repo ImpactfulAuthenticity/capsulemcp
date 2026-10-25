@@ -1,3 +1,8 @@
+import {
+  openRateLimitWindow,
+  RATE_LIMIT_WINDOW_CAP_MS,
+  rateLimitWindowLeft,
+} from "./rate-limit-window.js";
 import { fetch, type Response } from "undici";
 import { readBool } from "../env.js";
 import { logEvent, logVerbose, redactPath } from "../log.js";
@@ -128,7 +133,7 @@ function parseNextPage(linkHeader: string | null): number | undefined {
 }
 
 /**
- * Decide how long to wait before retrying a 429.
+ * Decide whether — and how long — to wait before retrying a 429.
  *
  * Capsule's API publishes its rate-limit reset time via
  * `X-RateLimit-Reset` (UTC epoch seconds), NOT the standard
@@ -137,18 +142,38 @@ function parseNextPage(linkHeader: string | null): number | undefined {
  *   "wait until the time inside the X-RateLimit-Reset header before
  *    it makes any other API requests for the specific user"
  *
- * The hourly window means the reset can be many minutes out. We cap
- * the wait at 60 seconds so a long-quota-exhaustion doesn't block a
- * Cloud Run request indefinitely; if Capsule says wait longer than
- * that, we surface the 429 and let the caller decide.
+ * The hourly window means the reset can be many minutes out. A wait of
+ * up to `RATE_LIMIT_MAX_WAIT_MS` is worth one retry; beyond that a
+ * retry cannot succeed within any sane request budget, so the result
+ * is `{ resetInMs }` and the caller surfaces the 429 at once — no
+ * sleep, no second request. (Clamping a 50-minute reset to 60 s, as
+ * earlier versions did, pinned a request slot for a minute and then
+ * spent a request on a retry guaranteed to 429 again.)
  *
  * Honour `X-RateLimit-Reset` first, then `Retry-After` as a
  * defensive fallback (in case Capsule ever standardises), then a
  * 5-second default if neither is present or parseable.
  */
-function parseRateLimitDelay(res: Response): number {
+const RATE_LIMIT_MAX_WAIT_MS = 60_000;
+type RateLimitPlan = { waitMs: number } | { resetInMs: number };
+
+function planFromDelay(delayMs: number): RateLimitPlan {
+  // Capsule's window is one hour: cap an absurd or non-finite header
+  // (e.g. `1e306`) so the remembered window and the message stay sane.
+  const capped = Math.min(delayMs, RATE_LIMIT_WINDOW_CAP_MS);
+  return capped > RATE_LIMIT_MAX_WAIT_MS ? { resetInMs: capped } : { waitMs: capped };
+}
+
+// Once a far-off reset is known, every further call fails fast without a
+// request — Capsule's docs: wait until X-RateLimit-Reset "before it makes
+// any other API requests for the specific user". One process holds one
+// token, so a batch or fan-out tool no longer fires N requests that are
+// all certain to 429. Only `doFetch` consults the window; the
+// token-health probe (`capsuleProbe`) keeps asking, so /health reports
+// what Capsule actually says. State lives in ./rate-limit-window.ts.
+
+function parseRateLimitDelay(res: Response): RateLimitPlan {
   const DEFAULT_MS = 5_000;
-  const MAX_WAIT_MS = 60_000;
 
   // 1. Capsule-specific: X-RateLimit-Reset (UTC epoch seconds).
   const resetRaw = res.headers.get("X-RateLimit-Reset");
@@ -158,8 +183,8 @@ function parseRateLimitDelay(res: Response): number {
       const delta = resetEpochSec * 1000 - Date.now();
       // Reset already in the past (clock skew, or window just rolled
       // over): retry quickly.
-      if (delta <= 0) return DEFAULT_MS;
-      return Math.min(delta, MAX_WAIT_MS);
+      if (delta <= 0) return { waitMs: DEFAULT_MS };
+      return planFromDelay(delta);
     }
   }
 
@@ -168,17 +193,31 @@ function parseRateLimitDelay(res: Response): number {
   if (retryAfter) {
     const seconds = Number(retryAfter);
     if (Number.isFinite(seconds) && seconds >= 0) {
-      return Math.min(seconds * 1000, MAX_WAIT_MS);
+      return planFromDelay(seconds * 1000);
     }
     const dateMs = Date.parse(retryAfter);
     if (Number.isFinite(dateMs)) {
       const delta = dateMs - Date.now();
-      return delta > 0 ? Math.min(delta, MAX_WAIT_MS) : DEFAULT_MS;
+      return delta > 0 ? planFromDelay(delta) : { waitMs: DEFAULT_MS };
     }
   }
 
   // 3. No usable hint — wait a conservative default.
-  return DEFAULT_MS;
+  return { waitMs: DEFAULT_MS };
+}
+
+/**
+ * The caller-facing 429. Whole minutes on purpose: the text is stable
+ * across the items of one batch, so `batch.complete.failureReasons`
+ * groups them as one cause.
+ */
+function rateLimitExhaustedError(resetInMs: number): CapsuleApiError {
+  const minutes = Math.max(1, Math.ceil(resetInMs / 60_000));
+  return new CapsuleApiError(
+    429,
+    `Capsule's API rate limit for this token is exhausted; it resets in about ${minutes} min. ` +
+      "Not retried — Capsule rejects every request until then, so wait for the reset.",
+  );
 }
 
 interface CapsuleErrorBody {
@@ -336,19 +375,44 @@ async function doFetch(url: string, options: Parameters<typeof fetch>[1]): Promi
   const startedAt = Date.now();
   const method = options?.method ?? "GET";
 
+  // Inside a window Capsule already announced: no request, no event —
+  // the 429 that opened the window was logged once. Fail fast even in
+  // the window's last minute: a hidden sleep here would hold the call
+  // past an MCP client's own timeout, and a write could then land after
+  // the caller had given up (and retried).
+  const windowLeft = rateLimitWindowLeft(startedAt);
+  if (windowLeft > 0) throw rateLimitExhaustedError(windowLeft);
+
   const first = await fetchWithTimeout(url, options);
 
   if (first.status === 429) {
-    const delay = parseRateLimitDelay(first);
+    const plan = parseRateLimitDelay(first);
     // Cancel the unread 429 body so the connection returns to the pool
     // now, rather than being pinned through the back-off window. (Each
     // fetch gets its own AbortSignal.timeout, so the back-off sleep
     // can't be cut short by the first attempt's signal.)
     await drainBody(first);
-    await new Promise((resolve) => setTimeout(resolve, delay));
+    if ("resetInMs" in plan) {
+      // Quota exhausted until well past any request budget: report it
+      // now, and remember the window so later calls don't re-ask a
+      // question whose answer is already known.
+      openRateLimitWindow(Date.now() + plan.resetInMs);
+      emitCapsuleRateLimited(method, url, Date.now() - startedAt, {
+        retried: false,
+        resetInMs: plan.resetInMs,
+      });
+      throw rateLimitExhaustedError(plan.resetInMs);
+    }
+    await new Promise((resolve) => setTimeout(resolve, plan.waitMs));
+    // A concurrent call may have learnt of a long window while we slept:
+    // don't spend the retry on a request Capsule has already refused.
+    const leftAfterWait = rateLimitWindowLeft();
+    if (leftAfterWait > 0) throw rateLimitExhaustedError(leftAfterWait);
 
     const retried = await fetchWithTimeout(url, options);
     if (retried.status === 429) {
+      const again = parseRateLimitDelay(retried);
+      if ("resetInMs" in again) openRateLimitWindow(Date.now() + again.resetInMs);
       await drainBody(retried);
       // This terminal 429 throws before `consumeBody`, so without an
       // explicit emit it leaves no structured trace and never counts
@@ -357,7 +421,7 @@ async function doFetch(url: string, options: Parameters<typeof fetch>[1]): Promi
       // request that exhausted its retry (and may have burned up to 60s
       // of backoff) is exactly the rate-limit-pressure signal we want
       // visible. Forced, like the failure events.
-      emitCapsuleRateLimited(method, url, Date.now() - startedAt);
+      emitCapsuleRateLimited(method, url, Date.now() - startedAt, { retried: true });
       throw new CapsuleApiError(
         429,
         "Rate limit exceeded after one retry. Please slow down your requests.",
@@ -516,20 +580,25 @@ function emitCapsuleFailure(
 }
 
 /**
- * Emit a forced `capsule.ratelimit` event for a request that exhausted
- * its single 429 retry. Like the terminal timeout/error paths this
- * throws inside `doFetch` before `consumeBody`, so without this emit the
- * call — which may have burned up to 60s of backoff waiting on
- * Capsule's rate-limit reset — would be invisible and uncounted in
+ * Emit a forced `capsule.ratelimit` event for a request that ended in a
+ * 429: either its single retry was throttled too (`retried: true`; it
+ * may have spent up to `RATE_LIMIT_MAX_WAIT_MS` in back-off), or the
+ * reset was too far out to wait for and the 429 was surfaced at once
+ * (`retried: false`, with `resetInMs`). Like the terminal timeout/error
+ * paths this throws inside `doFetch` before `consumeBody`, so without
+ * this emit the call would be invisible and uncounted in
  * `tool.chain.capsuleCalls`. Forced + redacted path, same discipline as
- * `emitCapsuleFailure`. `elapsedMs` spans both attempts plus the
- * backoff, so a single `capsule.ratelimit` row explains a ballooned
- * chain latency on its own.
+ * `emitCapsuleFailure`.
  */
-function emitCapsuleRateLimited(method: string, url: string, elapsedMs: number): void {
+function emitCapsuleRateLimited(
+  method: string,
+  url: string,
+  elapsedMs: number,
+  detail: { retried: boolean; resetInMs?: number },
+): void {
   logEvent(
     "capsule.ratelimit",
-    { method, path: redactedPath(url), elapsedMs, status: 429 },
+    { method, path: redactedPath(url), elapsedMs, status: 429, ...detail },
     { force: true },
   );
 }

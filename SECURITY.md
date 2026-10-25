@@ -6,10 +6,11 @@ Please **do not** open a public GitHub issue for security problems.
 
 Two private channels:
 
-- **Email**: `anton@deadbeef.mx` — PGP-encrypted is welcome but not required.
-- **GitHub Security Advisories**: open a private advisory at
+- **GitHub private vulnerability reporting** (preferred): open a private
+  advisory at
   <https://github.com/soil-dev/capsulemcp/security/advisories/new>. Only
   maintainers can see it until disclosure.
+- **Email**: `anton@deadbeef.mx`.
 
 When you report, please include:
 
@@ -29,9 +30,16 @@ re-send — mail filters happen.
 In scope:
 
 - The capsulemcp server itself — stdio entry (`dist/index.js`) and
-  HTTP+OAuth entry (`dist/http.js`).
+  HTTP+OAuth entry (`dist/http.js`), including the unauthenticated
+  `GET /health` page.
 - The auth and rate-limit code paths in `src/auth/` and `src/http/`.
 - The Capsule API client in `src/capsule/`.
+- Tool registration and gating in `src/server/` (read-only mode, tiers,
+  confirm-gated destructive tools) and the MCP Tasks store in
+  `src/tasks/` (one client reading or cancelling another's task is a
+  data-exposure bug).
+- The release pipeline (`.github/workflows/publish.yml`): anything that
+  could get unreviewed code published under the `capsulemcp` name.
 - Anything that could exfiltrate a user's `CAPSULE_API_TOKEN`,
   bypass `CAPSULE_MCP_READONLY=1`, or sign tokens the server would
   accept.
@@ -48,7 +56,25 @@ Out of scope:
 
 ## Versioning of fixes
 
-Security fixes land on `master` and are tagged as a patch release
-(`vX.Y.Z+1`). Pre-1.0 we don't backport to older minor versions —
-upgrade is the supported path. After 1.0, the most recent two minor
-lines will receive patch backports for security-class issues.
+Security fixes land on `master` and ship in the next release — a patch
+release when nothing else is pending. Only the latest release line is
+supported; there are no backports to older minor versions, so upgrading
+is the supported path.
+
+## Release integrity
+
+Releases after v2.4.0 are published to npm only from this repository's
+[`publish.yml`](.github/workflows/publish.yml) GitHub Actions workflow,
+dispatched on the release tag, through npm Trusted Publishing with
+staged publishing: the workflow can only stage a version, and it goes
+public when a maintainer approves it with 2FA. Each carries an npm
+provenance attestation whose identity is
+`https://github.com/soil-dev/capsulemcp`, workflow
+`.github/workflows/publish.yml`, ref `refs/tags/vX.Y.Z`.
+[INSTALL.md → Release integrity](INSTALL.md#release-integrity) shows a
+one-line check. A newer version whose attestation names anything else —
+or that has none — was not built by this repository: do not install it,
+and report it through one of the channels above. (That is a policy the
+maintainers keep, not something npm can enforce on its own: someone
+holding the npm account could still publish by hand, which is exactly
+what the identity check catches.)
