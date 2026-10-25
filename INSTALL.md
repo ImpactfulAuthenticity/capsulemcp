@@ -22,7 +22,7 @@ Paste this into the file (merge with existing `mcpServers` if you have other con
   "mcpServers": {
     "capsule": {
       "command": "npx",
-      "args": ["-y", "capsulemcp@2.4.0"],
+      "args": ["-y", "capsulemcp@2.5.0"],
       "env": {
         "CAPSULE_API_TOKEN": "<your read-scoped capsule token>",
         "CAPSULE_MCP_READONLY": "1"
@@ -43,7 +43,7 @@ Restart Claude Desktop. The Capsule tools appear in the tool picker.
 If you're tracking a fork, an unreleased branch, or a specific commit you control, swap the npm name for a GitHub ref:
 
 ```json
-"args": ["-y", "github:soil-dev/capsulemcp#v2.4.0"]
+"args": ["-y", "github:soil-dev/capsulemcp#v2.5.0"]
 ```
 
 Same flags, same env, just installs from a git clone instead of the npm tarball. Useful for development; for production, prefer the npm form above.
@@ -51,7 +51,7 @@ Same flags, same env, just installs from a git clone instead of the npm tarball.
 ## Path 2 — Claude Code
 
 ```sh
-claude mcp add capsule --env CAPSULE_API_TOKEN=<your token> --env CAPSULE_MCP_READONLY=1 -- npx -y capsulemcp@2.4.0
+claude mcp add capsule --env CAPSULE_API_TOKEN=<your token> --env CAPSULE_MCP_READONLY=1 -- npx -y capsulemcp@2.5.0
 ```
 
 This writes the entry to Claude Code's MCP config (`~/.claude.json`). Same `env` model as Claude Desktop's JSON — no shell-export needed.
@@ -60,10 +60,10 @@ If you'd rather not have the token in `~/.claude.json`, omit the `--env` flag an
 
 ```sh
 export CAPSULE_API_TOKEN=<your token>
-claude mcp add capsule --env CAPSULE_MCP_READONLY=1 -- npx -y capsulemcp@2.4.0
+claude mcp add capsule --env CAPSULE_MCP_READONLY=1 -- npx -y capsulemcp@2.5.0
 ```
 
-Drop `CAPSULE_MCP_READONLY=1` only if you want the write tools (and use a write-scoped token for them). To install from a GitHub ref instead of npm (development / fork tracking), replace `capsulemcp@2.4.0` with `github:soil-dev/capsulemcp#v2.4.0`.
+Drop `CAPSULE_MCP_READONLY=1` only if you want the write tools (and use a write-scoped token for them). To install from a GitHub ref instead of npm (development / fork tracking), replace `capsulemcp@2.5.0` with `github:soil-dev/capsulemcp#v2.5.0`.
 
 ## Release integrity
 

@@ -11,15 +11,24 @@ versions adhere to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
-Fixes every confirmed finding of the 2026-10-07 security review
-(adversarial multi-agent review; none critical or high), the issues a
-second adversarial review of the fixes surfaced, and 13 dependency
-advisories — two of them in direct runtime dependencies.
+## [2.5.0] — 2026-10-25
+
+Security release: fixes every confirmed finding of the 2026-10-07
+security review (adversarial multi-agent review; none critical or
+high), the issues three successive adversarial reviews of the fixes
+surfaced, and 19 dependency advisories across 9 packages (12 on the
+runtime path, 7 in dev tooling) — four of them in two direct runtime
+dependencies, undici and zod. The first release published through the
+staged, provenance-attested workflow (see *Release integrity*). One new
+environment variable (`MCP_HTTP_HOST`) and one behaviour change for
+containers running insecure-auto-approve mode; `get_attachment` now
+returns text attachments as a JSON object with an untrusted-data notice.
+No Capsule wire-shape change. 92 tools (53 read-only), 696 tests.
 
 ### Security
 
-- **insecure-auto-approve mode no longer listens on every interface.**
-  Its loopback guard only checked the `PUBLIC_BASE_URL` string, so with
+- **insecure-auto-approve mode with a loopback `PUBLIC_BASE_URL` no
+  longer listens on every interface.** Its loopback guard only checked the `PUBLIC_BASE_URL` string, so with
   `PUBLIC_BASE_URL=http://localhost:…` the socket still bound every
   interface and anyone on the same network could `POST /register` and
   use the configured Capsule token (reproduced from a LAN address). The
@@ -36,15 +45,17 @@ advisories — two of them in direct runtime dependencies.
   containers running insecure-auto-approve:** a published port no
   longer reaches the server until both variables opt in (DEPLOY.md,
   *OAuth modes*). Static-client mode — every production deployment —
-  still binds every interface.
+  and insecure mode already acknowledged for a non-loopback URL still
+  bind every interface.
 - **Request bodies never reach the logs.** express 5.3.0's default
   error logger prints the whole error object, and body-parser attaches
   the raw request body to it — so a malformed `/mcp` request would have
   logged tool arguments, and a malformed `/token` request the
   `client_secret`. A terminal error handler now logs only method, path,
-  status and error type, and answers with a fixed JSON shape (a
-  JSON-RPC parse error on `/mcp`, an OAuth `invalid_request`
-  elsewhere) — never the body or a stack trace.
+  status and error type, and answers with a fixed JSON shape — on
+  `/mcp` a JSON-RPC error (parse error for malformed JSON, invalid
+  request otherwise), elsewhere an OAuth `invalid_request` (or
+  `server_error` for a 5xx) — never the body or a stack trace.
 - **Attachment and timeline content can no longer pose as connector
   output.** `get_attachment` returned decoded text attachments as a
   bare content block — read by the model exactly like the connector's
@@ -95,8 +106,8 @@ advisories — two of them in direct runtime dependencies.
   release line only); new *Release integrity* section.
 - Dependencies — `npm audit` back to 0 at all levels (was 1 critical,
   5 high, 3 moderate across 9 packages):
-  - direct: **undici** 8.12.3 (3 high: EventSource memory DoS, SRI
-    bypass, content-encoding DoS — GHSA-4qv8-2p9j-2685,
+  - direct: **undici** 8.12.3 (1 high, 2 moderate: EventSource memory DoS,
+    SRI bypass, content-encoding DoS — GHSA-4qv8-2p9j-2685,
     GHSA-f72v-6w45-q472, GHSA-xjj6-f33q-929c); **zod** 4.6.7 (high:
     memory exhaustion validating oversized constrained collections,
     GHSA-mrhx-c7xc-m3w5); **express** 5.3.0, which requires
@@ -131,13 +142,19 @@ advisories — two of them in direct runtime dependencies.
   `capsule.ratelimit` event gains `retried` and, for an immediate
   surface, `resetInMs`. The token-health probe is unaffected and keeps
   reporting what Capsule says.
+- `/token` client-authentication errors now carry
+  `Access-Control-Allow-Origin: *` and `Cache-Control: no-store`, like
+  the SDK's own token responses (a browser-based client could not read
+  them, and they were cacheable).
 - body-parser 2.4.0 also accepts `Content-Encoding: zstd` request
   bodies (decompressed before the size limit applies, like gzip).
 - INSTALL.md's Claude Code commands now set `CAPSULE_MCP_READONLY=1`,
   matching the Desktop snippets.
 - Dependencies to latest: `@modelcontextprotocol/sdk` 1.32.2,
-  `express-rate-limit` 8.7.1 (runtime); tsup 9.0.0 (major: drops
-  Node < 22.18; this package requires ≥ 22.19 — output unchanged),
+  `express-rate-limit` 8.7.1 (runtime); tsup 9.0.0 (major: supports
+  Node ^22.18, ^24.11 or ≥ 26 only, so building from source on Node 23,
+  25 or 24 before 24.11 is unsupported — runtime engines unchanged at
+  ≥ 22.19, output unchanged),
   `@biomejs/biome` 2.6.3 (config migrated), vitest 5.0.5,
   `@types/node` 26.6.5 (dev).
 
